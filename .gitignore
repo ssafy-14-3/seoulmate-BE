@@ -1,7 +1,6 @@
+.venv/
 venv/
 __pycache__/
 *.pyc
 .env
 api_spec.md
-.env
-.env
