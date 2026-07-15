@@ -1,3 +1,5 @@
 fastapi
 uvicorn[standard]
 SQLAlchemy
+gunicorn
+python-dotenv
