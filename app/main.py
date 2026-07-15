@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import re
 import urllib.error
 import urllib.request
+import logging
 from datetime import datetime
 from typing import Optional
 
@@ -99,6 +100,49 @@ def _review_stats_subquery(db: Session):
         .group_by(Review.location_id)
         .subquery()
     )
+
+def _build_chat_messages(
+    payload: ChatRequest,
+    recommendations: list[ChatRecommendedLocation],
+) -> list[dict[str, str]]:
+    location_text = "\n".join(
+        [
+            f"- {location.name} / 카테고리: {location.category} / "
+            f"평점: {location.avg_rating if location.avg_rating is not None else '없음'}"
+            for location in recommendations
+        ]
+    )
+
+    system_content = (
+        "너는 서울 관광지와 지역 정보를 안내하는 챗봇이다. "
+        "사용자의 질문에 친절하고 간결하게 답변해라. "
+        "제공된 추천 장소 정보가 있으면 이를 기반으로 답변해라.\n\n"
+        f"추천 장소:\n{location_text or '관련 장소 없음'}"
+    )
+
+    messages = [
+        {
+            "role": "system",
+            "content": system_content,
+        }
+    ]
+
+    for history_item in payload.history:
+        messages.append(
+            {
+                "role": history_item.role,
+                "content": history_item.content,
+            }
+        )
+
+    messages.append(
+        {
+            "role": "user",
+            "content": payload.message,
+        }
+    )
+
+    return messages
 
 
 def _rounded(value: Optional[float]) -> Optional[float]:
@@ -344,43 +388,27 @@ def _search_recommended_locations(db: Session, message: str) -> list[ChatRecomme
     ]
 
 
-def _build_chat_messages(payload: ChatRequest, recommendations: list[ChatRecommendedLocation]) -> list[dict[str, str]]:
-    if recommendations:
-        context_lines = [
-            f"- {item.name} ({item.category or '미분류'}, 평균평점: {item.avg_rating if item.avg_rating is not None else '리뷰 없음'})"
-            for item in recommendations
-        ]
-        context_text = "\n".join(context_lines)
-    else:
-        context_text = "- 관련 장소 정보를 찾지 못했습니다."
-
-    system_prompt = (
-        "너는 서울 지역 여행/장소 추천 도우미다. "
-        "아래 장소 데이터만 근거로 추천하고, 없으면 없다고 말해라.\n"
-        f"{context_text}"
-    )
-
-    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
-    for item in payload.history[-10:]:
-        if item.role in {"user", "assistant"}:
-            messages.append({"role": item.role, "content": item.content})
-    messages.append({"role": "user", "content": payload.message})
-    return messages
-
-
 @app.post("/api/chat", response_model=ChatResponse)
-def chat_api(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
+def chat_api(
+    payload: ChatRequest,
+    db: Session = Depends(get_db),
+) -> ChatResponse:
     recommendations = _search_recommended_locations(db, payload.message)
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
-        _raise_error(502, "CHAT_UPSTREAM_ERROR", "챗봇 서버 호출에 실패했습니다.")
+        _raise_error(
+            502,
+            "CHAT_UPSTREAM_ERROR",
+            "챗봇 서버 호출에 실패했습니다.",
+        )
 
     request_body = {
-        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "model": os.getenv("OPENAI_MODEL", "gpt-5-mini"),
         "messages": _build_chat_messages(payload, recommendations),
-        "max_tokens": 400,
+        "max_completion_tokens": 400,
     }
+
     request = urllib.request.Request(
         "https://api.openai.com/v1/chat/completions",
         data=json.dumps(request_body).encode("utf-8"),
@@ -391,22 +419,84 @@ def chat_api(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatRespons
         method="POST",
     )
 
+    logger = logging.getLogger("uvicorn.error")
+
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            response_payload = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError):
-        _raise_error(502, "CHAT_UPSTREAM_ERROR", "챗봇 서버 호출에 실패했습니다.")
+            response_payload = json.loads(
+                response.read().decode("utf-8")
+            )
+
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8")
+        except Exception:
+            err_body = "<no body>"
+
+        logger.error(
+            "OpenAI HTTPError code=%s body=%s",
+            getattr(e, "code", None),
+            err_body,
+        )
+
+        _raise_error(
+            502,
+            "CHAT_UPSTREAM_ERROR",
+            "챗봇 서버 호출에 실패했습니다.",
+        )
+
+    except urllib.error.URLError as e:
+        logger.error("OpenAI URLError: %s", e)
+
+        _raise_error(
+            502,
+            "CHAT_UPSTREAM_ERROR",
+            "챗봇 서버 호출에 실패했습니다.",
+        )
+
+    except Exception:
+        logger.exception("OpenAI call failed")
+
+        _raise_error(
+            502,
+            "CHAT_UPSTREAM_ERROR",
+            "챗봇 서버 호출에 실패했습니다.",
+        )
 
     choices = response_payload.get("choices")
+
     if not choices:
-        _raise_error(502, "CHAT_UPSTREAM_ERROR", "챗봇 서버 호출에 실패했습니다.")
-    message = choices[0].get("message") if isinstance(choices[0], dict) else None
-    reply = message.get("content") if isinstance(message, dict) else None
+        logger.error("OpenAI response has no choices: %s", response_payload)
+        _raise_error(
+            502,
+            "CHAT_UPSTREAM_ERROR",
+            "챗봇 서버 호출에 실패했습니다.",
+        )
+
+    message = (
+        choices[0].get("message")
+        if isinstance(choices[0], dict)
+        else None
+    )
+
+    reply = (
+        message.get("content")
+        if isinstance(message, dict)
+        else None
+    )
+
     if not reply:
-        _raise_error(502, "CHAT_UPSTREAM_ERROR", "챗봇 서버 호출에 실패했습니다.")
+        logger.error("OpenAI response has no content: %s", response_payload)
+        _raise_error(
+            502,
+            "CHAT_UPSTREAM_ERROR",
+            "챗봇 서버 호출에 실패했습니다.",
+        )
 
-    return ChatResponse(reply=reply, recommended_locations=recommendations)
-
+    return ChatResponse(
+        reply=reply,
+        recommended_locations=recommendations,
+    )
 
 @app.get("/api/stats/reviews", response_model=ReviewStatsResponse)
 def review_stats_api(db: Session = Depends(get_db)) -> ReviewStatsResponse:
