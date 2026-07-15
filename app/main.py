@@ -107,20 +107,36 @@ def _build_chat_messages(
 ) -> list[dict[str, str]]:
     location_text = "\n".join(
         [
-            f"- {location.name} / 카테고리: {location.category} / "
-            f"평점: {location.avg_rating if location.avg_rating is not None else '없음'}"
+            (
+                f"- 장소명: {location.name}\n"
+                f"  카테고리: {location.category}\n"
+                f"  평균 평점: "
+                f"{location.avg_rating if location.avg_rating is not None else '평점 없음'}"
+            )
             for location in recommendations
         ]
     )
 
-    system_content = (
-        "너는 서울 관광지와 지역 정보를 안내하는 챗봇이다. "
-        "사용자의 질문에 친절하고 간결하게 답변해라. "
-        "제공된 추천 장소 정보가 있으면 이를 기반으로 답변해라.\n\n"
-        f"추천 장소:\n{location_text or '관련 장소 없음'}"
-    )
+    system_content = f"""
+너는 서울의 관광지와 지역 정보를 안내하는 챗봇이다.
 
-    messages = [
+다음 규칙에 따라 답변해라.
+
+1. 사용자의 질문에 친절하고 자연스럽게 답변한다.
+2. 답변은 특별한 요청이 없다면 3~5문장 이내로 간결하게 작성한다.
+3. 아래에 제공된 추천 장소가 있다면 해당 정보를 우선 활용한다.
+4. 제공된 장소 정보에 없는 운영시간, 가격, 휴무일 등의 정보를 임의로 만들어내지 않는다.
+5. 정확히 알 수 없는 정보는 확인이 필요하다고 안내한다.
+6. 사용자가 장소를 추천해 달라고 하면 장소명과 추천 이유를 함께 설명한다.
+7. 이전 대화 이력이 있으면 해당 맥락을 이어서 답변한다.
+8. 답변에 불필요한 추론 과정이나 내부 판단 과정을 노출하지 않는다.
+9. 서울 관광 및 지역 정보와 무관한 질문에는 간단히 답변하되, 관광 안내 기능을 자연스럽게 소개한다.
+
+현재 검색된 추천 장소 정보:
+{location_text or "관련 장소를 찾지 못했습니다."}
+""".strip()
+
+    messages: list[dict[str, str]] = [
         {
             "role": "system",
             "content": system_content,
@@ -128,6 +144,9 @@ def _build_chat_messages(
     ]
 
     for history_item in payload.history:
+        if history_item.role not in ("user", "assistant"):
+            continue
+
         messages.append(
             {
                 "role": history_item.role,
@@ -143,7 +162,6 @@ def _build_chat_messages(
     )
 
     return messages
-
 
 def _rounded(value: Optional[float]) -> Optional[float]:
     if value is None:
@@ -393,25 +411,40 @@ def chat_api(
     payload: ChatRequest,
     db: Session = Depends(get_db),
 ) -> ChatResponse:
-    recommendations = _search_recommended_locations(db, payload.message)
+    logger = logging.getLogger("uvicorn.error")
+
+    recommendations = _search_recommended_locations(
+        db,
+        payload.message,
+    )
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
+        logger.error("OPENAI_API_KEY가 설정되지 않았습니다.")
         _raise_error(
             502,
             "CHAT_UPSTREAM_ERROR",
             "챗봇 서버 호출에 실패했습니다.",
         )
 
+    model = os.getenv("OPENAI_MODEL", "gpt-5-mini").strip()
+
     request_body = {
-        "model": os.getenv("OPENAI_MODEL", "gpt-5-mini"),
-        "messages": _build_chat_messages(payload, recommendations),
-        "max_completion_tokens": 400,
+        "model": model,
+        "messages": _build_chat_messages(
+            payload,
+            recommendations,
+        ),
+        "reasoning_effort": "minimal",
+        "max_completion_tokens": 1000,
     }
 
     request = urllib.request.Request(
         "https://api.openai.com/v1/chat/completions",
-        data=json.dumps(request_body).encode("utf-8"),
+        data=json.dumps(
+            request_body,
+            ensure_ascii=False,
+        ).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -419,10 +452,11 @@ def chat_api(
         method="POST",
     )
 
-    logger = logging.getLogger("uvicorn.error")
-
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(
+            request,
+            timeout=30,
+        ) as response:
             response_payload = json.loads(
                 response.read().decode("utf-8")
             )
@@ -446,12 +480,24 @@ def chat_api(
         )
 
     except urllib.error.URLError as e:
-        logger.error("OpenAI URLError: %s", e)
+        logger.error(
+            "OpenAI URLError: %s",
+            e,
+        )
 
         _raise_error(
             502,
             "CHAT_UPSTREAM_ERROR",
             "챗봇 서버 호출에 실패했습니다.",
+        )
+
+    except TimeoutError:
+        logger.exception("OpenAI API 호출 시간이 초과되었습니다.")
+
+        _raise_error(
+            504,
+            "CHAT_UPSTREAM_TIMEOUT",
+            "챗봇 서버 응답 시간이 초과되었습니다.",
         )
 
     except Exception:
@@ -466,27 +512,51 @@ def chat_api(
     choices = response_payload.get("choices")
 
     if not choices:
-        logger.error("OpenAI response has no choices: %s", response_payload)
+        logger.error(
+            "OpenAI response has no choices: %s",
+            response_payload,
+        )
         _raise_error(
             502,
             "CHAT_UPSTREAM_ERROR",
             "챗봇 서버 호출에 실패했습니다.",
         )
 
+    first_choice = choices[0]
+
     message = (
-        choices[0].get("message")
-        if isinstance(choices[0], dict)
+        first_choice.get("message")
+        if isinstance(first_choice, dict)
         else None
     )
 
     reply = (
-        message.get("content")
+        message.get("content", "").strip()
         if isinstance(message, dict)
-        else None
+        else ""
     )
 
     if not reply:
-        logger.error("OpenAI response has no content: %s", response_payload)
+        finish_reason = (
+            first_choice.get("finish_reason")
+            if isinstance(first_choice, dict)
+            else None
+        )
+
+        logger.error(
+            "OpenAI response has no content. "
+            "finish_reason=%s response=%s",
+            finish_reason,
+            response_payload,
+        )
+
+        if finish_reason == "length":
+            _raise_error(
+                502,
+                "CHAT_TOKEN_LIMIT_ERROR",
+                "챗봇 답변 생성 중 토큰 한도를 초과했습니다.",
+            )
+
         _raise_error(
             502,
             "CHAT_UPSTREAM_ERROR",
