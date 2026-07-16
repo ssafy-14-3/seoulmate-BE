@@ -186,13 +186,22 @@ def list_locations_api(
             review_stats.c.avg_rating,
         )
         .join(ContentType, Location.content_type_id == ContentType.id)
+        .join(Region, Location.region_id == Region.id)
         .outerjoin(review_stats, review_stats.c.location_id == Location.id)
     )
 
     if category:
         query = query.filter(ContentType.name == category)
     if q:
-        query = query.filter(Location.name.ilike(f"%{q}%"))
+        pattern = f"%{q}%"
+        query = query.filter(
+            or_(
+                Location.name.ilike(pattern),
+                Region.name.ilike(pattern),
+                Location.address.ilike(pattern),
+                ContentType.name.ilike(pattern),
+            )
+        )
 
     total = query.count()
     skip = (page - 1) * size
@@ -379,6 +388,7 @@ def _search_recommended_locations(db: Session, message: str) -> list[ChatRecomme
             review_stats.c.review_count,
         )
         .join(ContentType, Location.content_type_id == ContentType.id)
+        .join(Region, Location.region_id == Region.id)
         .outerjoin(review_stats, review_stats.c.location_id == Location.id)
     )
     if keywords:
@@ -388,6 +398,7 @@ def _search_recommended_locations(db: Session, message: str) -> list[ChatRecomme
             keyword_conditions.append(
                 or_(
                     Location.name.ilike(pattern),
+                    Region.name.ilike(pattern),
                     Location.address.ilike(pattern),
                     ContentType.name.ilike(pattern),
                 )
