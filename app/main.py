@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -15,7 +15,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from .database import get_db, init_db
-from .models import ContentType, Location, Review
+from .models import ContentType, Location, Review, Region
 from .schemas import (
     CategoryReviewStatsItem,
     ChatRecommendedLocation,
@@ -406,167 +406,349 @@ def _search_recommended_locations(db: Session, message: str) -> list[ChatRecomme
     ]
 
 
-@app.post("/api/chat", response_model=ChatResponse)
-def chat_api(
-    payload: ChatRequest,
-    db: Session = Depends(get_db),
-) -> ChatResponse:
-    logger = logging.getLogger("uvicorn.error")
-
-    recommendations = _search_recommended_locations(
-        db,
-        payload.message,
-    )
-
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        logger.error("OPENAI_API_KEY가 설정되지 않았습니다.")
-        _raise_error(
-            502,
-            "CHAT_UPSTREAM_ERROR",
-            "챗봇 서버 호출에 실패했습니다.",
-        )
-
-    model = os.getenv("OPENAI_MODEL", "gpt-5-mini").strip()
-
-    request_body = {
-        "model": model,
-        "messages": _build_chat_messages(
-            payload,
-            recommendations,
-        ),
-        "reasoning_effort": "minimal",
-        "max_completion_tokens": 1000,
-    }
-
+def _call_openai(request_body: dict, api_key: str, logger: logging.Logger, timeout: int = 30) -> dict:
     request = urllib.request.Request(
         "https://api.openai.com/v1/chat/completions",
-        data=json.dumps(
-            request_body,
-            ensure_ascii=False,
-        ).encode("utf-8"),
+        data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
         method="POST",
     )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _parse_intent_with_gpt(message: str, model: str, api_key: str, logger: logging.Logger) -> tuple[Optional[dict], str]:
+    system = (
+        "당신은 사용자의 한국어 질문에서 세 가지 값을 추출하는 도우미입니다: "
+        "'area' (예: '종로구' 또는 '홍대입구' 등), "
+        "'category' (정확히 하나: 관광지, 레포츠, 문화시설, 쇼핑, 숙박, 여행코스, 축제공연행사), "
+        "'preference' (선택사항, 예: '아이와 함께', '데이트', '조용한 곳').\n"
+        "응답은 반드시 JSON 객체 하나만 출력하세요. 예: "
+        "{\"area\": \"강남구\", \"category\": \"관광지\", \"preference\": \"아이와 함께\"}\n"
+        "만약 'area' 또는 'category'를 정확히 판단할 수 없으면 해당 값을 null로 설정하세요. 다른 설명을 붙이지 마세요."
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"질문: {message}\n\nJSON으로만 응답해 주세요."},
+    ]
+    request_body = {"model": model, "messages": messages, "reasoning_effort": "minimal", "max_completion_tokens": 300}
+    try:
+        payload = _call_openai(request_body, api_key, logger)
+    except Exception:
+        logger.exception("intent parse OpenAI call failed")
+        raise
+
+    choices = payload.get("choices") or []
+    if not choices:
+        return None, ""
+
+    first = choices[0]
+    msg = first.get("message") if isinstance(first, dict) else None
+    content = (msg.get("content", "") if isinstance(msg, dict) else "") or ""
 
     try:
-        with urllib.request.urlopen(
-            request,
-            timeout=30,
-        ) as response:
-            response_payload = json.loads(
-                response.read().decode("utf-8")
-            )
-
-    except urllib.error.HTTPError as e:
-        try:
-            err_body = e.read().decode("utf-8")
-        except Exception:
-            err_body = "<no body>"
-
-        logger.error(
-            "OpenAI HTTPError code=%s body=%s",
-            getattr(e, "code", None),
-            err_body,
-        )
-
-        _raise_error(
-            502,
-            "CHAT_UPSTREAM_ERROR",
-            "챗봇 서버 호출에 실패했습니다.",
-        )
-
-    except urllib.error.URLError as e:
-        logger.error(
-            "OpenAI URLError: %s",
-            e,
-        )
-
-        _raise_error(
-            502,
-            "CHAT_UPSTREAM_ERROR",
-            "챗봇 서버 호출에 실패했습니다.",
-        )
-
-    except TimeoutError:
-        logger.exception("OpenAI API 호출 시간이 초과되었습니다.")
-
-        _raise_error(
-            504,
-            "CHAT_UPSTREAM_TIMEOUT",
-            "챗봇 서버 응답 시간이 초과되었습니다.",
-        )
-
+        parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            return parsed, content
     except Exception:
-        logger.exception("OpenAI call failed")
+        m = re.search(r"\{.*\}", content, flags=re.S)
+        if m:
+            try:
+                parsed = json.loads(m.group(0))
+                if isinstance(parsed, dict):
+                    return parsed, content
+            except Exception:
+                pass
 
-        _raise_error(
-            502,
-            "CHAT_UPSTREAM_ERROR",
-            "챗봇 서버 호출에 실패했습니다.",
-        )
+    return None, content
 
-    choices = response_payload.get("choices")
 
+def _ask_gpt_recommend(candidates: List[dict], preference: Optional[str], user_message: str, model: str, api_key: str, logger: logging.Logger) -> tuple[Optional[dict], str]:
+    cand_text = "\n".join(
+        [
+            f"- id: {c['id']}\n  name: {c['name']}\n  address: {c.get('address')}\n  avg_rating: {c.get('avg_rating')}\n  review_count: {c.get('review_count')}\n  latest_review: {c.get('latest_review') or ''}"
+            for c in candidates
+        ]
+    )
+    system = (
+        "당신은 서울의 장소를 추천하는 도우미입니다. 아래에 제공된 후보 목록에서 최대 3개를 선택하세요. "
+        "반드시 후보의 'id'만 사용하여 추천하고, 후보 목록에 없는 장소를 생성하거나 추가하지 마세요. "
+        "출력은 반드시 JSON으로만 아래 형식으로 반환하세요:\n"
+        '{"answer": "<간단한 안내/요약>", "recommendations": [{"location_id": 123, "reason": "추천 이유(1~2문장)"}]}'
+        "\n추천 이유는 후보 데이터(리뷰 수, 평균 평점, 최신 리뷰 등)에 기반하여 작성하세요."
+    )
+    user = (
+        f"사용자 질문: {user_message}\n"
+        f"선호: {preference or ''}\n\n"
+        f"후보 목록:\n{cand_text}\n\n"
+        "JSON 형식으로만 응답하세요."
+    )
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    request_body = {"model": model, "messages": messages, "reasoning_effort": "minimal", "max_completion_tokens": 600}
+    try:
+        payload = _call_openai(request_body, api_key, logger)
+    except Exception:
+        logger.exception("recommend OpenAI call failed")
+        raise
+
+    choices = payload.get("choices") or []
     if not choices:
-        logger.error(
-            "OpenAI response has no choices: %s",
-            response_payload,
-        )
-        _raise_error(
-            502,
-            "CHAT_UPSTREAM_ERROR",
-            "챗봇 서버 호출에 실패했습니다.",
-        )
+        return None, ""
 
-    first_choice = choices[0]
+    first = choices[0]
+    msg = first.get("message") if isinstance(first, dict) else None
+    content = (msg.get("content", "") if isinstance(msg, dict) else "") or ""
 
-    message = (
-        first_choice.get("message")
-        if isinstance(first_choice, dict)
-        else None
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            return parsed, content
+    except Exception:
+        m = re.search(r"\{.*\}", content, flags=re.S)
+        if m:
+            try:
+                parsed = json.loads(m.group(0))
+                if isinstance(parsed, dict):
+                    return parsed, content
+            except Exception:
+                pass
+
+    return None, content
+
+
+def _db_top_n(db: Session, n: int = 3) -> List[dict]:
+    review_stats = _review_stats_subquery(db)
+    rows = (
+        db.query(Location, ContentType.name.label("category_name"), review_stats.c.review_count, review_stats.c.avg_rating)
+        .join(ContentType, Location.content_type_id == ContentType.id)
+        .outerjoin(review_stats, review_stats.c.location_id == Location.id)
+        .order_by(func.coalesce(review_stats.c.review_count, 0).desc(), func.coalesce(review_stats.c.avg_rating, 0).desc(), Location.id.asc())
+        .limit(n)
+        .all()
     )
+    result = []
+    for row in rows:
+        loc = row.Location
+        result.append(
+            {
+                "id": loc.id,
+                "name": loc.name,
+                "category": row.category_name,
+                "address": loc.address,
+                "image_url": loc.first_image_url,
+                "review_count": int(row.review_count or 0),
+                "avg_rating": _rounded(row.avg_rating),
+            }
+        )
+    return result
 
-    reply = (
-        message.get("content", "").strip()
-        if isinstance(message, dict)
-        else ""
-    )
 
-    if not reply:
-        finish_reason = (
-            first_choice.get("finish_reason")
-            if isinstance(first_choice, dict)
-            else None
+@app.post("/api/chat", response_model=ChatResponse)
+def chat_api(payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
+    logger = logging.getLogger("uvicorn.error")
+
+    # Legacy quick candidates (keyword based)
+    quick_candidates = _search_recommended_locations(db, payload.message)
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    model = os.getenv("OPENAI_MODEL", "gpt-5-mini").strip()
+
+    # If API key missing, fallback to DB top-n
+    if not api_key:
+        logger.error("OPENAI_API_KEY가 설정되지 않았습니다. DB 폴백을 반환합니다.")
+        top = _db_top_n(db, 3)
+        return ChatResponse(
+            reply="챗봇 서버 호출에 실패하여 데이터베이스 상위 결과를 반환합니다.",
+            answer=None,
+            recommended_locations=[
+                ChatRecommendedLocation(**t, reason=f"리뷰 {t['review_count']}건 · 평균 평점 {t['avg_rating']}")
+                for t in top
+            ],
         )
 
-        logger.error(
-            "OpenAI response has no content. "
-            "finish_reason=%s response=%s",
-            finish_reason,
-            response_payload,
+    # 1) Try to parse intent (area, category, preference)
+    try:
+        intent, raw = _parse_intent_with_gpt(payload.message, model, api_key, logger)
+    except Exception:
+        top = _db_top_n(db, 3)
+        return ChatResponse(
+            reply="챗봇 서버 호출에 실패하여 데이터베이스 상위 결과를 반환합니다.",
+            answer=None,
+            recommended_locations=[
+                ChatRecommendedLocation(**t, reason=f"리뷰 {t['review_count']}건 · 평균 평점 {t['avg_rating']}")
+                for t in top
+            ],
         )
 
-        if finish_reason == "length":
-            _raise_error(
-                502,
-                "CHAT_TOKEN_LIMIT_ERROR",
-                "챗봇 답변 생성 중 토큰 한도를 초과했습니다.",
+    # If GPT didn't return JSON intent, treat as legacy reply
+    if intent is None:
+        return ChatResponse(reply=raw or "", answer=None, recommended_locations=quick_candidates)
+
+    area = (intent.get("area") or "").strip() if intent.get("area") else None
+    category = (intent.get("category") or "").strip() if intent.get("category") else None
+    preference = (intent.get("preference") or "").strip() if intent.get("preference") else None
+
+    allowed_categories = {"관광지", "레포츠", "문화시설", "쇼핑", "숙박", "여행코스", "축제공연행사"}
+
+    missing_parts = []
+    if not area:
+        missing_parts.append("지역(예: '종로구')")
+    if not category or category not in allowed_categories:
+        missing_parts.append("카테고리(관광지/레포츠/문화시설/쇼핑/숙박/여행코스/축제공연행사 중 하나)")
+    if missing_parts:
+        ask = "정확한 " + " 및 ".join(missing_parts) + "을/를 입력해 주세요."
+        return ChatResponse(reply=ask, answer=None, recommended_locations=[])
+
+    # DB search by area + category (limit 10, sorted by review count desc, avg desc)
+    review_stats = _review_stats_subquery(db)
+    area_pattern = f"%{area}%"
+    rows = (
+        db.query(Location, ContentType.name.label("category_name"), review_stats.c.review_count, review_stats.c.avg_rating)
+        .join(ContentType, Location.content_type_id == ContentType.id)
+        .join(Region, Location.region_id == Region.id)
+        .outerjoin(review_stats, review_stats.c.location_id == Location.id)
+        .filter(ContentType.name == category)
+        .filter(
+            or_(
+                Region.name.ilike(area_pattern),
+                Location.address.ilike(area_pattern),
+                Location.address_detail.ilike(area_pattern),
             )
+        )
+        .order_by(func.coalesce(review_stats.c.review_count, 0).desc(), func.coalesce(review_stats.c.avg_rating, 0).desc(), Location.id.asc())
+        .limit(10)
+        .all()
+    )
 
-        _raise_error(
-            502,
-            "CHAT_UPSTREAM_ERROR",
-            "챗봇 서버 호출에 실패했습니다.",
+    if not rows:
+        return ChatResponse(reply="해당 지역 및 카테고리에서 장소를 찾을 수 없습니다. 다른 지역 또는 카테고리를 입력해 주세요.", answer=None, recommended_locations=[])
+
+    # If single result, return directly
+    if len(rows) == 1:
+        row = rows[0]
+        loc = row.Location
+        item = ChatRecommendedLocation(
+            id=loc.id,
+            name=loc.name,
+            category=row.category_name,
+            address=loc.address,
+            image_url=loc.first_image_url,
+            review_count=int(row.review_count or 0),
+            avg_rating=_rounded(row.avg_rating),
+            reason="검색 조건과 일치하는 유일한 결과입니다.",
+        )
+        reply = f"요청하신 조건에 맞는 장소가 하나 있습니다: {loc.name}."
+        return ChatResponse(reply=reply, answer=reply, recommended_locations=[item])
+
+    # Multiple results: build candidate list with latest review
+    candidates = []
+    for row in rows:
+        loc = row.Location
+        latest_review = db.query(Review).filter(Review.location_id == loc.id).order_by(Review.created_at.desc()).first()
+        candidates.append(
+            {
+                "id": loc.id,
+                "name": loc.name,
+                "address": loc.address,
+                "image_url": loc.first_image_url,
+                "review_count": int(row.review_count or 0),
+                "avg_rating": _rounded(row.avg_rating),
+                "latest_review": (latest_review.content if latest_review else None),
+            }
         )
 
-    return ChatResponse(
-        reply=reply,
-        recommended_locations=recommendations,
-    )
+    # Ask GPT to rank/recommend up to 3 among candidates
+    try:
+        parsed_rec, raw_rec = _ask_gpt_recommend(candidates, preference, payload.message, model, api_key, logger)
+    except Exception:
+        # fallback to top 3 from DB order
+        fallback = candidates[:3]
+        return ChatResponse(
+            reply="챗봇 서버 호출에 실패하여 데이터베이스 상위 결과를 반환합니다.",
+            answer=None,
+            recommended_locations=[
+                ChatRecommendedLocation(
+                    id=item["id"],
+                    name=item["name"],
+                    category=None,
+                    address=item["address"],
+                    image_url=item["image_url"],
+                    review_count=item["review_count"],
+                    avg_rating=item["avg_rating"],
+                    reason=f"리뷰 {item['review_count']}건 · 평균 평점 {item['avg_rating']}",
+                )
+                for item in fallback
+            ],
+        )
+
+    if not parsed_rec:
+        return ChatResponse(reply=raw_rec or "", answer=None, recommended_locations=[
+            ChatRecommendedLocation(
+                id=c["id"],
+                name=c["name"],
+                category=None,
+                address=c["address"],
+                image_url=c["image_url"],
+                avg_rating=c["avg_rating"],
+                review_count=c["review_count"],
+                reason=None,
+            )
+            for c in candidates[:3]
+        ])
+
+    answer_text = parsed_rec.get("answer") or ""
+    recs = parsed_rec.get("recommendations") or []
+
+    final_items: List[ChatRecommendedLocation] = []
+    allowed_ids = {c["id"] for c in candidates}
+    seen = set()
+    for r in recs:
+        try:
+            lid = int(r.get("location_id"))
+        except Exception:
+            continue
+        if lid in seen or lid not in allowed_ids:
+            continue
+        seen.add(lid)
+        cand = next((c for c in candidates if c["id"] == lid), None)
+        if not cand:
+            continue
+        reason = r.get("reason") or ""
+        final_items.append(
+            ChatRecommendedLocation(
+                id=cand["id"],
+                name=cand["name"],
+                category=None,
+                address=cand["address"],
+                image_url=cand["image_url"],
+                review_count=cand["review_count"],
+                avg_rating=cand["avg_rating"],
+                reason=reason,
+            )
+        )
+        if len(final_items) >= 3:
+            break
+
+    if not final_items:
+        fallback = candidates[:3]
+        final_items = [
+            ChatRecommendedLocation(
+                id=item["id"],
+                name=item["name"],
+                category=None,
+                address=item["address"],
+                image_url=item["image_url"],
+                review_count=item["review_count"],
+                avg_rating=item["avg_rating"],
+                reason=f"리뷰 {item['review_count']}건 · 평균 평점 {item['avg_rating']}",
+            )
+            for item in fallback
+        ]
+
+    return ChatResponse(reply=answer_text or "", answer=answer_text or None, recommended_locations=final_items)
 
 @app.get("/api/stats/reviews", response_model=ReviewStatsResponse)
 def review_stats_api(db: Session = Depends(get_db)) -> ReviewStatsResponse:

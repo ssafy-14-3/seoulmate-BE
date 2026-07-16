@@ -293,8 +293,10 @@ class ApiTests(unittest.TestCase):
     def test_chat_endpoint_without_api_key(self) -> None:
         with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
             response = self.client.post("/api/chat", json={"message": "경복궁 추천해줘", "history": []})
-        self.assertEqual(response.status_code, 502)
-        self.assertEqual(response.json()["detail"]["code"], "CHAT_UPSTREAM_ERROR")
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("recommended_locations", payload)
+        self.assertGreaterEqual(len(payload["recommended_locations"]), 1)
 
     def test_chat_endpoint_success(self) -> None:
         class MockOpenAIResponse:
